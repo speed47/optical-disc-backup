@@ -1,0 +1,65 @@
+# modify the values below to suit your use case
+STATICDIR=/folder/containing/this/file
+TITLE=name_of_the_backup
+SRC=/source/directory
+WD=/some/tmp/place
+# LIST is the list of directories to backup from $SRC, if you want to backup all $SRC, say '.' here.
+LIST='dir1 dir2'
+
+# create a temporary working directory
+mkdir $WD
+
+# Create hashdeep & md5 files of all the untouched contents, and verify it's ok:
+( cd $SRC; hashdeep -rl $LIST ) | tee $WD/files_$TITLE.hashdeep
+perl -ne '/(\d+),(.+?),(.+?),(.+)/ and print "$2  $4\n"' $WD/files_$TITLE.hashdeep > $WD/files_$TITLE.md5
+( cd $SRC; md5sum -c $WD/files_$TITLE.md5 )
+
+# Create a muti-part encrypted 7zip archive from the $LIST files/directories in $SRC:
+mkdir -p $WD/prepare; ( cd $SRC; 7z a -mx=9 -ms=off -p -v100m $WD/prepare/$TITLE.7z $LIST )
+
+# Choose the number of discs to use, this script can help:
+bash $STATICDIR/how_many_disks.sh $WD/prepare
+
+# Replace the 'XX' below by the total disc number to use, we'll compute the number of archives to put per disc from it:
+nbdiscs=XX
+nbarchperdisc=$(( $(find $WD/prepare/ -type f -name "*.7z.*" | wc -l) / nbdiscs))
+
+# Set the size of the discs we use, either DVD-R or BD-R or whatever else you have
+discmb=4485 # DVD-R
+discmb=23098 # BD-R
+
+# For each target disk:
+for i in $(seq 1 $nbdiscs)
+do
+   # Remember my name:
+   [ $nbdiscs = 1 ] && thisone=$TITLE || thisone=${TITLE}_${i}of${nbdiscs}
+
+   # Move $nbarchperdisc archives to the target directory (split the 7z evenly across disks):
+   mkdir -p $WD/target$i; j=1; while [ $j -le $nbarchperdisc ]; do mv -v $(find $WD/prepare -type f -name "*.7z.*" | sort | head -n1) $WD/target$i/ ; j=$((j+1)); done
+
+   # Copy our txt files, script, and the previously built files.hashdeep/md5:
+   mkdir $WD/target$i/meta; cp -va $STATICDIR/* $WD/files_$TITLE.{hashdeep,md5} $WD/target$i/meta
+
+   # Hash all this stuff & make it dvdsig compliant:
+   mv -v $WD/target$i/meta/progs/dvdsig.exe $WD/target$i/
+   ( cd $WD/target$i; hashdeep -rl * | tee $thisone.hashdeep )
+   perl -ne '/^\d+,(.{32}),.+?,(.+)$/ or next; $f=$2; $h=$1; $f=~s=/=\\=; print "$f,$h\n"' $WD/target$i/$thisone.hashdeep > $WD/target$i/dvdsig.md5
+
+   # Then, build iso image, with Joliet and Rock Ridge extensions and verify it's not too big:
+   genisoimage -o $WD/$thisone.iso -J -r -V "$thisone" -volset "$thisone" -sysid "$(date)" $WD/target$i/
+   $STATICDIR/check_iso_size.sh $WD/$thisone.iso
+
+   # Then, inject md5sum into the iso file:
+   implantisomd5 $WD/$thisone.iso
+
+   # Then, build an ecc recovery file for the iso image, and verify it's still not too big:
+   dvdisaster -c -i $WD/$thisone.iso -mRS03 -x $(nproc)
+   $STATICDIR/check_iso_size.sh $WD/$thisone.iso
+
+   # Burn!
+   xorrecord dev=/dev/sr0 -toc --grow_overwritable_iso
+   xorrecord -v dev=/dev/sr0 blank=format_overwrite
+   xorrecord -v -nopad dev=/dev/sr0 $WD/$thisone.iso
+
+# Repeat for each disk until all the 7z files are handled
+done
